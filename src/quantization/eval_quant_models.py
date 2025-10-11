@@ -1,30 +1,31 @@
 # src/quantization/eval_quant_models.py
 """
-Enhanced evaluation script for quantized models with optional Weights & Biases (wandb)
-- Prints model existence and sizes
-- Attempts multiple load strategies (GPTQModel, transformers+bitsandbytes, plain transformers)
-- Runs a short generation and records timings / GPU peak memory
-- Logs benchmark metrics and artifacts to wandb (if installed and env configured)
-- Writes human-readable benchmark.md and per-model output files to ./outputs/
+Robust evaluator for quantized models (Phi3-EdgeQuant-Agent).
+Measures:
+ - model size (on-disk)
+ - load time
+ - generation latency
+ - GPU peak bytes (torch.cuda.max_memory_allocated)
+ - RSS memory before/after (psutil if available)
 
-Environment variables (optional, used when wandb is available):
-WANDB_PROJECT=Phi3-EdgeQuant-Agent
-WANDB_ENTITY=stifler
-WANDB_DIR=./wandb_logs
-WANDB_MODE=online
-
-Save location for outputs: ./outputs/
+Usage:
+    python src/quantization/eval_quant_models.py            # run all models under BASE
+    python src/quantization/eval_quant_models.py --limit 3  # test only first 3
 """
 
-import os
-import time
-import shutil
-import json
+import os, time, json, sys, argparse
 from pathlib import Path
 from datetime import datetime
+from tqdm import tqdm
 
-# --- Utilities -----------------------------------------------------------------
+# User-config (edit if needed)
+BASE = Path("D:/Phi3-EdgeQuant-Agent/models/quantized")
+OUT_DIR = Path.cwd() / "outputs" / "quant_eval"
+OUT_DIR.mkdir(parents=True, exist_ok=True)
+PROMPT = "Explain knowledge distillation in AI in simple terms."
+MAX_NEW_TOKENS = 120
 
+# Utilities
 def human_size(path: Path):
     try:
         total = 0
@@ -42,281 +43,305 @@ def human_size(path: Path):
     except Exception:
         return "N/A"
 
-
-def ensure_outputs_dir(base: Path):
-    out = base / "outputs"
-    out.mkdir(parents=True, exist_ok=True)
-    return out
-
-
-# --- Configuration -------------------------------------------------------------
-print("Found quantized models in D:/Phi3-EdgeQuant-Agent/models/quantized\n")
-BASE = Path(r"D:/Phi3-EdgeQuant-Agent/models/quantized")
-models = [
-    BASE / "Phi-3-mini-4k-instruct-1bit",
-    BASE / "Phi-3-mini-4k-instruct-4bit-gptq",
-    BASE / "Phi-3-mini-4k-instruct-8bit-gptq",
-]
-
-# Prompt to use
-PROMPT = "Explain knowledge distillation in AI in simple terms."
-
-# Outputs/benchmarks base
-OUT_BASE = Path.cwd()
-OUT_DIR = ensure_outputs_dir(OUT_BASE)
-BENCHMARK_MD = OUT_DIR / "benchmark.md"
-BENCH_JSON = OUT_DIR / "benchmark.json"
-
-# Prepare benchmark outputs
-bench_records = []
-
-# --- WandB setup (optional) ---------------------------------------------------
-try:
-    import wandb
-    WANDB_AVAILABLE = True
-    # Respect environment variables if set; else allow user defaults through explicit kwargs
-    wandb_project = os.environ.get("WANDB_PROJECT", "Phi3-EdgeQuant-Agent")
-    wandb_entity = os.environ.get("WANDB_ENTITY", None)
-    # set wandb dir if provided
-    if os.environ.get("WANDB_DIR"):
-        os.environ.setdefault("WANDB_DIR", os.environ.get("WANDB_DIR"))
-    print("wandb available; will attempt to log runs if wandb.init succeeds.")
-except Exception:
-    wandb = None
-    WANDB_AVAILABLE = False
-    print("wandb not available — continuing without external experiment logging.")
-
-
-# --- Core: try load and generate -----------------------------------------------
-
-def try_load_and_generate(model_path: Path):
-    record = {
-        "model_name": model_path.name,
-        "path": str(model_path),
-        "exists": model_path.exists(),
-        "size": human_size(model_path) if model_path.exists() else "N/A",
-        "timestamp": datetime.utcnow().isoformat() + "Z",
-        "success": False,
-        "loader": None,
-        "load_time_s": None,
-        "gen_time_s": None,
-        "gpu_peak_bytes": None,
-        "output_snippet": None,
-        "error": None,
-    }
-
-    print(f"\n--- {model_path.name} ---")
-    if not model_path.exists():
-        print("Path not found, skipping.")
-        return record
-
-    # Optionally initialize a wandb run per-model
-    run = None
-    if WANDB_AVAILABLE:
-        try:
-            run = wandb.init(project=wandb_project, entity=wandb_entity, name=model_path.name, reinit=True)
-            run.log({"model/size": record["size"]})
-        except Exception as e:
-            print("wandb.init failed, continuing locally:", e)
-            run = None
-
-    # Try GPTQModel (if available)
+def get_rss_bytes():
     try:
-        from gptqmodel import GPTQModel
-        print("Trying to load with GPTQModel.from_pretrained()...")
-        start = time.time()
-        # try common signatures
-        try:
-            m = GPTQModel.from_pretrained(str(model_path), device="cuda", quantize="8bit")
-            record["loader"] = "GPTQModel.from_pretrained(signature A)"
-        except Exception:
-            try:
-                qc = {"bits": 8}
-                m = GPTQModel.from_pretrained(str(model_path), quantize_config=qc, device="cuda")
-                record["loader"] = "GPTQModel.from_pretrained(signature B)"
-            except Exception:
-                if hasattr(GPTQModel, "load_from_pretrained"):
-                    m = GPTQModel.load_from_pretrained(str(model_path))
-                    record["loader"] = "GPTQModel.load_from_pretrained"
-                else:
-                    raise RuntimeError("GPTQModel present but no usable loader signature succeeded.")
-        load_elapsed = time.time() - start
-        record["load_time_s"] = load_elapsed
-        # tokenizer
-        from transformers import AutoTokenizer
-        tokenizer = AutoTokenizer.from_pretrained(str(model_path), trust_remote_code=True)
-        # generate
+        import psutil
+        return psutil.Process().memory_info().rss
+    except Exception:
+        return None
+
+def write_output_txt(name, text, meta):
+    p = OUT_DIR / f"{name}_output.txt"
+    with open(p, "w", encoding="utf-8") as f:
+        f.write(f"# model: {name}\n# time: {datetime.utcnow().isoformat()}Z\n\n")
+        f.write(text or "")
+    return str(p)
+
+def safe_reset_cuda():
+    try:
         import torch
         if torch.cuda.is_available():
-            torch.cuda.empty_cache(); torch.cuda.reset_peak_memory_stats()
-        start = time.time()
-        out = m.generate(PROMPT, max_new_tokens=120, temperature=0.7, top_p=0.95)
-        gen_elapsed = time.time() - start
-        record["gen_time_s"] = gen_elapsed
-        # decode
+            torch.cuda.empty_cache()
+            torch.cuda.reset_peak_memory_stats()
+    except Exception:
+        pass
+
+# --- Loader attempts ---
+
+def try_autogptq_load_generate(model_path: Path, prompt: str):
+    """
+    Try using auto_gptq (AutoGPTQForCausalLM). Returns ((text, meta), None) on success,
+    or (None, error_str) on failure.
+    """
+    try:
+        import torch
+        from transformers import AutoTokenizer
+        from auto_gptq import AutoGPTQForCausalLM
+    except Exception as e:
+        return None, f"auto-gptq-missing: {e}"
+
+    device = "cuda:0" if torch.cuda.is_available() else "cpu"
+    try:
+        start = time.perf_counter()
+        tokenizer = AutoTokenizer.from_pretrained(str(model_path), use_fast=False, trust_remote_code=True)
+        # AutoGPTQ loader - try from_quantized then from_pretrained
+        try:
+            model = AutoGPTQForCausalLM.from_quantized(str(model_path), device=device, use_safetensors=True, trust_remote_code=True)
+            loader_name = "AutoGPTQ.from_quantized"
+        except Exception:
+            model = AutoGPTQForCausalLM.from_pretrained(str(model_path), device=device, use_safetensors=True, trust_remote_code=True)
+            loader_name = "AutoGPTQ.from_pretrained"
+        load_time = time.perf_counter() - start
+
+        # generate
+        safe_reset_cuda()
+        gen_start = time.perf_counter()
+        inputs = tokenizer(prompt, return_tensors="pt")
+        if device.startswith("cuda"):
+            inputs = {k: v.to(device) for k, v in inputs.items()}
+            model.to(device)
+        gen_out = model.generate(**inputs, max_new_tokens=MAX_NEW_TOKENS)
+        gen_time = time.perf_counter() - gen_start
+
+        # GPU peak
+        gpu_peak = 0
+        try:
+            gpu_peak = int(torch.cuda.max_memory_allocated()) if torch.cuda.is_available() else 0
+        except Exception:
+            gpu_peak = 0
+
+        text = tokenizer.decode(gen_out[0], skip_special_tokens=True) if hasattr(tokenizer, "decode") else str(gen_out)
+        meta = {"loader": loader_name, "load_time_s": load_time, "gen_time_s": gen_time, "gpu_peak_bytes": gpu_peak}
+        return (text, meta), None
+    except Exception as e:
+        return None, f"auto-gptq-error: {e}"
+
+def try_gptqmodel_load_generate(model_path: Path, prompt: str):
+    """
+    Try older gptqmodel (gptqmodel.GPTQModel) loader if installed.
+    """
+    try:
+        import torch
+        from transformers import AutoTokenizer
+        from gptqmodel import GPTQModel
+    except Exception as e:
+        return None, f"gptqmodel-missing: {e}"
+
+    try:
+        start = time.perf_counter()
+        # Many GPTQModel implementations expose from_pretrained/from_quantized
+        try:
+            model = GPTQModel.from_pretrained(str(model_path), device="cuda")
+            loader_name = "GPTQModel.from_pretrained"
+        except Exception:
+            if hasattr(GPTQModel, "from_quantized"):
+                model = GPTQModel.from_quantized(str(model_path), device="cuda")
+                loader_name = "GPTQModel.from_quantized"
+            else:
+                model = GPTQModel.from_pretrained(str(model_path), device="cuda")
+                loader_name = "GPTQModel.from_pretrained"
+        load_time = time.perf_counter() - start
+
+        tokenizer = AutoTokenizer.from_pretrained(str(model_path), trust_remote_code=True)
+
+        safe_reset_cuda()
+        gen_start = time.perf_counter()
+        out = model.generate(prompt, max_new_tokens=MAX_NEW_TOKENS)
+        gen_time = time.perf_counter() - gen_start
+        gpu_peak = 0
+        try:
+            gpu_peak = int(torch.cuda.max_memory_allocated()) if torch.cuda.is_available() else 0
+        except Exception:
+            gpu_peak = 0
+
         if isinstance(out, str):
             text = out
         else:
-            try:
-                text = tokenizer.decode(out[0], skip_special_tokens=True)
-            except Exception:
-                text = str(out)
-        record["output_snippet"] = text[:1000]
-        import torch
-        record["gpu_peak_bytes"] = torch.cuda.max_memory_allocated() if torch.cuda.is_available() else 0
-        record["success"] = True
-        print(f"Loaded via GPTQModel. Time: {gen_elapsed:.3f}s, GPU peak bytes: {record['gpu_peak_bytes']}")
+            text = tokenizer.decode(out[0], skip_special_tokens=True) if tokenizer is not None else str(out)
 
-        # save outputs
-        save_model_run_outputs(model_path, text, record, run)
-        if run:
-            run.log(record)
-            run.finish()
-        return record
+        meta = {"loader": loader_name, "load_time_s": load_time, "gen_time_s": gen_time, "gpu_peak_bytes": gpu_peak}
+        return (text, meta), None
     except Exception as e:
-        print("GPTQModel load/generate failed:", e)
-        record["error"] = str(e)
+        return None, f"gptqmodel-error: {e}"
 
-    # Fallback: transformers + bitsandbytes (8-bit or 4-bit) or plain transformers
+def try_transformers_bnb_load_generate(model_path: Path, prompt: str):
+    """
+    Use transformers + BitsAndBytesConfig for bnb loading.
+    """
     try:
         import torch
         from transformers import AutoTokenizer, AutoModelForCausalLM
         try:
+            # prefer official BitsAndBytesConfig
             from transformers import BitsAndBytesConfig
+            bnb_cfg = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_use_double_quant=True, bnb_4bit_quant_type="nf4")
         except Exception:
+            # fallback minimal config shim
             class BitsAndBytesConfig:
                 def __init__(self, **kw):
                     self.__dict__.update(kw)
-
-        print("Trying transformers AutoModelForCausalLM.from_pretrained (with bitsandbytes config where possible)...")
-        bnb_cfg = BitsAndBytesConfig(load_in_8bit=True, llm_int8_threshold=6.0, llm_int8_enable_fp32_cpu_offload=True)
-        tokenizer = AutoTokenizer.from_pretrained(str(model_path), trust_remote_code=True)
-        start = time.time()
-        model = AutoModelForCausalLM.from_pretrained(str(model_path),
-                                                     quantization_config=bnb_cfg,
-                                                     device_map="auto",
-                                                     trust_remote_code=True)
-        load_elapsed = time.time() - start
-        record["load_time_s"] = load_elapsed
-        record["loader"] = "transformers+bitsandbytes"
-
-        inputs = tokenizer(PROMPT, return_tensors="pt").to(model.device)
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache(); torch.cuda.reset_peak_memory_stats()
-        start = time.time()
-        outputs = model.generate(**inputs, max_new_tokens=120, temperature=0.7, top_p=0.95)
-        gen_elapsed = time.time() - start
-        record["gen_time_s"] = gen_elapsed
-        decoded = tokenizer.decode(outputs[0], skip_special_tokens=True)
-        record["output_snippet"] = decoded[:1000]
-        record["gpu_peak_bytes"] = torch.cuda.max_memory_allocated() if torch.cuda.is_available() else 0
-        record["success"] = True
-        print(f"transformers+bitsandbytes generation done. Time: {gen_elapsed:.3f}s, GPU peak bytes: {record['gpu_peak_bytes']}")
-
-        save_model_run_outputs(model_path, decoded, record, run)
-        if run:
-            run.log(record)
-            run.finish()
-        return record
+            bnb_cfg = BitsAndBytesConfig(load_in_4bit=True)
     except Exception as e:
-        print("transformers + bitsandbytes load failed:", e)
-        record.setdefault("errors", []).append(str(e))
+        return None, f"transformers-bnb-missing: {e}"
 
-    # Final fallback: plain transformers (float32/16) load
     try:
-        from transformers import AutoTokenizer, AutoModelForCausalLM
-        print("Trying plain AutoModelForCausalLM.from_pretrained (no quant libs)...")
-        start = time.time()
         tokenizer = AutoTokenizer.from_pretrained(str(model_path), trust_remote_code=True)
-        model = AutoModelForCausalLM.from_pretrained(str(model_path), device_map="auto", trust_remote_code=True)
-        load_elapsed = time.time() - start
-        record["load_time_s"] = load_elapsed
-        record["loader"] = "transformers_plain"
-
-        inputs = tokenizer(PROMPT, return_tensors="pt").to(model.device)
-        import torch
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache(); torch.cuda.reset_peak_memory_stats()
-        start = time.time()
-        outputs = model.generate(**inputs, max_new_tokens=120)
-        gen_elapsed = time.time() - start
-        record["gen_time_s"] = gen_elapsed
-        decoded = tokenizer.decode(outputs[0], skip_special_tokens=True)
-        record["output_snippet"] = decoded[:1000]
-        record["gpu_peak_bytes"] = torch.cuda.max_memory_allocated() if torch.cuda.is_available() else 0
-        record["success"] = True
-        print(f"Plain transformers generation done. Time: {gen_elapsed:.3f}s, GPU peak bytes: {record['gpu_peak_bytes']}")
-
-        save_model_run_outputs(model_path, decoded, record, run)
-        if run:
-            run.log(record)
-            run.finish()
-        return record
     except Exception as e:
-        print("Plain transformers load failed too:", e)
-        record.setdefault("errors", []).append(str(e))
+        return None, f"tokenizer-error: {e}"
 
-    # If we reach here, nothing worked
-    if run:
+    try:
+        start = time.perf_counter()
+        model = AutoModelForCausalLM.from_pretrained(str(model_path),
+                                                    quantization_config=bnb_cfg,
+                                                    device_map="auto",
+                                                    trust_remote_code=True)
+        load_time = time.perf_counter() - start
+    except Exception as e:
+        return None, f"transformers-bnb-load-error: {e}"
+
+    try:
+        inputs = tokenizer(prompt, return_tensors="pt").to(next(model.parameters()).device)
+        safe_reset_cuda()
+        gen_start = time.perf_counter()
+        out_ids = model.generate(**inputs, max_new_tokens=MAX_NEW_TOKENS)
+        gen_time = time.perf_counter() - gen_start
+        decoded = tokenizer.decode(out_ids[0], skip_special_tokens=True)
+        gpu_peak = 0
         try:
-            run.log(record)
+            gpu_peak = int(torch.cuda.max_memory_allocated()) if torch.cuda.is_available() else 0
         except Exception:
-            pass
+            gpu_peak = 0
+        meta = {"loader": "transformers+bitsandbytes", "load_time_s": load_time, "gen_time_s": gen_time, "gpu_peak_bytes": gpu_peak}
+        return (decoded, meta), None
+    except Exception as e:
+        return None, f"transformers-bnb-gen-error: {e}"
+
+def try_transformers_plain_load_generate(model_path: Path, prompt: str):
+    try:
+        import torch
+        from transformers import AutoTokenizer, AutoModelForCausalLM
+    except Exception as e:
+        return None, f"transformers-missing: {e}"
+
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(str(model_path), trust_remote_code=True)
+    except Exception as e:
+        return None, f"tokenizer-error: {e}"
+
+    try:
+        start = time.perf_counter()
+        model = AutoModelForCausalLM.from_pretrained(str(model_path), device_map="auto", trust_remote_code=True)
+        load_time = time.perf_counter() - start
+    except Exception as e:
+        return None, f"transformers-load-error: {e}"
+
+    try:
+        inputs = tokenizer(prompt, return_tensors="pt").to(next(model.parameters()).device)
+        safe_reset_cuda()
+        gen_start = time.perf_counter()
+        out_ids = model.generate(**inputs, max_new_tokens=MAX_NEW_TOKENS)
+        gen_time = time.perf_counter() - gen_start
+        decoded = tokenizer.decode(out_ids[0], skip_special_tokens=True)
+        gpu_peak = 0
         try:
-            run.finish()
+            gpu_peak = int(torch.cuda.max_memory_allocated()) if torch.cuda.is_available() else 0
         except Exception:
-            pass
-    return record
+            gpu_peak = 0
+        meta = {"loader": "transformers_plain", "load_time_s": load_time, "gen_time_s": gen_time, "gpu_peak_bytes": gpu_peak}
+        return (decoded, meta), None
+    except Exception as e:
+        return None, f"transformers-gen-error: {e}"
 
+# ---- Main loop ----
+def main(limit: int = None):
+    results = []
+    if not BASE.exists():
+        print("BASE not found:", BASE)
+        sys.exit(1)
 
-# --- Helpers for saving artifacts ------------------------------------------------
+    candidates = sorted([p for p in BASE.iterdir() if p.is_dir()])
+    if limit:
+        candidates = candidates[:limit]
 
-def save_model_run_outputs(model_path: Path, text: str, record: dict, run):
-    # writes plain output and updates benchmark.md. Also pushes small artifact to wandb if available
-    out_txt = OUT_DIR / f"{model_path.name}_output.txt"
-    with open(out_txt, "w", encoding="utf-8") as f:
-        f.write(f"# Model: {model_path.name}\n# Path: {model_path}\n# Timestamp: {record.get('timestamp')}\n\n")
-        f.write(text)
+    for model_path in tqdm(candidates, desc="models"):
+        print("\n---", model_path.name, "---")
+        rec = {"model_name": model_path.name, "path": str(model_path), "timestamp": datetime.utcnow().isoformat() + "Z"}
+        rec["exists"] = model_path.exists()
+        rec["size"] = human_size(model_path) if model_path.exists() else "N/A"
 
-    # append to benchmark.md
-    with open(BENCHMARK_MD, "a", encoding="utf-8") as f:
-        f.write(f"## {model_path.name}\n")
-        f.write(f"- path: {model_path}\n")
-        f.write(f"- exists: {record.get('exists')}\n")
-        f.write(f"- size: {record.get('size')}\n")
-        f.write(f"- loader: {record.get('loader')}\n")
-        f.write(f"- load_time_s: {record.get('load_time_s')}\n")
-        f.write(f"- gen_time_s: {record.get('gen_time_s')}\n")
-        f.write(f"- gpu_peak_bytes: {record.get('gpu_peak_bytes')}\n")
-        f.write(f"- success: {record.get('success')}\n")
-        f.write("\n```")
-        # write a short snippet for quick reading
-        snippet = (record.get('output_snippet') or "")[:800]
-        f.write(snippet)
-        f.write("\n``""\n\n")
+        files = [f.name for f in model_path.iterdir() if f.is_file()]
 
-    # push artifact to wandb (small text artifact)
-    if WANDB_AVAILABLE and run is not None:
-        try:
-            artifact = wandb.Artifact(f"{model_path.name}-output", type="output")
-            artifact.add_file(str(out_txt))
-            run.log_artifact(artifact)
-        except Exception as e:
-            print("wandb artifact upload failed:", e)
+        # Quick skip heuristic (if needed)
+        if not files:
+            rec["skipped"] = True
+            rec["note"] = "empty-folder"
+            print("Skipping empty folder")
+            results.append(rec)
+            continue
 
+        rss_before = get_rss_bytes()
 
-# --- Execute across all models -------------------------------------------------
+        # Try loaders in order. Prefer AutoGPTQ -> gptqmodel -> bnb -> plain transformers
+        out_text = None
+        meta = {}
+        error = None
 
-for mp in models:
-    rec = try_load_and_generate(mp)
-    bench_records.append(rec)
+        # 1) AutoGPTQ
+        res, err = try_autogptq_load_generate(model_path, PROMPT)
+        if res:
+            out_text, meta = res
+        else:
+            # 2) gptqmodel
+            res2, err2 = try_gptqmodel_load_generate(model_path, PROMPT)
+            if res2:
+                out_text, meta = res2
+                err = None
+            else:
+                # 3) transformers + bitsandbytes
+                res3, err3 = try_transformers_bnb_load_generate(model_path, PROMPT)
+                if res3:
+                    out_text, meta = res3
+                    err = None
+                else:
+                    # 4) plain transformers
+                    res4, err4 = try_transformers_plain_load_generate(model_path, PROMPT)
+                    if res4:
+                        out_text, meta = res4
+                        err = None
+                    else:
+                        # collect first non-empty error for reporting
+                        err = err or err2 or err3 or err4
 
-# write full JSON summary
-try:
-    with open(BENCH_JSON, "w", encoding="utf-8") as f:
-        json.dump(bench_records, f, indent=2)
-    print(f"Wrote benchmark summary to: {BENCH_JSON}")
-except Exception as e:
-    print("Failed to write JSON benchmark:", e)
+        rss_after = get_rss_bytes()
+        rec.update({
+            "loader": meta.get("loader") if meta else None,
+            "load_time_s": meta.get("load_time_s") if meta else None,
+            "gen_time_s": meta.get("gen_time_s") if meta else None,
+            "gpu_peak_bytes": meta.get("gpu_peak_bytes") if meta else None,
+            "rss_before_bytes": rss_before,
+            "rss_after_bytes": rss_after,
+            "success": out_text is not None,
+            "error": err,
+        })
 
-print("\nDone. If any model failed to load, paste the printed stacktrace here and I'll parse the exact fix.")
+        if out_text:
+            txt_path = write_output_txt(model_path.name, out_text, rec)
+            rec["output_file"] = txt_path
+            print(f"OK: loader={rec['loader']}, load_s={rec['load_time_s']:.3f}, gen_s={rec['gen_time_s']:.3f}, gpu_peak={rec['gpu_peak_bytes']}")
+        else:
+            print("FAIL:", rec["error"])
+
+        results.append(rec)
+
+    # write compact JSON
+    out_json = OUT_DIR / "benchmark.json"
+    with open(out_json, "w", encoding="utf-8") as f:
+        json.dump(results, f, indent=2)
+
+    print("\nWrote", out_json)
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--limit", type=int, default=None, help="limit number of models to evaluate")
+    args = parser.parse_args()
+    main(limit=args.limit)

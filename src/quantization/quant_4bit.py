@@ -1,160 +1,50 @@
-"""
-quant_8bit.py
-Produce an 8-bit quantized Phi-3 model.
+# download_hf_repo.py
+"""Download HF model repo to a local folder without loading into memory.
 
-Strategy:
-1) Try GPTQModel (preferred) using its quantize API (quantize bits=8).
-2) If GPTQModel call fails for any reason, fallback to bitsandbytes-style
-   8-bit using transformers + BitsAndBytesConfig (load_in_8bit -> then save).
-
-Notes:
-- GPTQModel behavior across versions varies; this script tries a safe call pattern.
-- On Windows, some native GPU libs (bitsandbytes/GPTQ CUDA ops) might be missing.
-  If you hit those errors, run this from WSL/Linux + GPU drivers for easiest success.
+Usage:
+    python -m src.quantization.download_hf_repo
 """
-import os
-import traceback
+
+from huggingface_hub import snapshot_download
 from pathlib import Path
+import shutil
+import sys
 
-MODEL_LOCAL = Path(r"D:/Phi3-EdgeQuant-Agent/models/microsoft/Phi-3-mini-4k-instruct")
-OUTPUT_DIR = Path(r"D:/Phi3-EdgeQuant-Agent/models/quantized/Phi-3-mini-4k-instruct-8bit-gptq")
-OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+# CHANGE THESE if you want
+HF_REPO_ID = "kaitchup/Phi-3-mini-4k-instruct-gptq-4bit"
+LOCAL_DIR = Path("D:/Phi3-EdgeQuant-Agent/models/quantized/Phi-3-mini-4k-instruct-4bit-gptq")
 
-# Useful debug: print versions
-def print_env():
+def main():
+    LOCAL_DIR.mkdir(parents=True, exist_ok=True)
+    print(f"🔽 snapshot_download('{HF_REPO_ID}') -> {LOCAL_DIR}")
     try:
-        import torch, transformers, sys
-        print(f"python: {sys.version.splitlines()[0]}")
-        print(f"torch: {torch.__version__} cuda: {torch.version.cuda}")
-        print(f"transformers: {transformers.__version__}")
+        # snapshot_download returns the path to the HF cache folder for that repo.
+        cache_path = snapshot_download(repo_id=HF_REPO_ID, allow_patterns=None, ignore_patterns=None)
+        print("✅ Downloaded to HF cache:", cache_path)
+
+        # Copy everything from the repo cache folder into LOCAL_DIR (overwrites files with same name)
+        # The snapshot_download returns a path like: <cache>/datasets/... or <cache>/repos/<user>/<repo>/...
+        # We assume it is the correct repo root containing model files.
+        from os import listdir
+        from os.path import join, isdir
+
+        # copy file-by-file to avoid moving unrelated files
+        import filecmp
+        for item in Path(cache_path).iterdir():
+            dest = LOCAL_DIR / item.name
+            if item.is_dir():
+                # copytree with dirs_exist_ok
+                shutil.copytree(item, dest, dirs_exist_ok=True)
+            else:
+                shutil.copy2(item, dest)
+        print(f"✅ All repo files copied to: {LOCAL_DIR}")
+        print("Files present:", [p.name for p in LOCAL_DIR.iterdir()][:40])
+        print("\nYou can now load the model from this folder later with `AutoModelForCausalLM.from_pretrained(LOCAL_DIR, trust_remote_code=True)` on a machine with proper native libs.")
     except Exception as e:
-        print("Failed printing environment:", e)
+        print("❗ Failed to download/copy repo files:")
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
 
-print("=== Environment ===")
-print_env()
-print("===================")
-
-# Attempt 1: GPTQModel quantization (preferred for benchmark parity)
-try:
-    print(">>> Attempting GPTQModel-based 8-bit quantization (preferred).")
-    # GPTQModel import may be installed as `gptqmodel` or a local clone. Try both.
-    try:
-        from gptqmodel import GPTQModel
-        print("Imported GPTQModel from site-packages.")
-    except Exception:
-        # try local clone path (if user cloned GPTQModel into repo)
-        import importlib.util, sys
-        local = Path(__file__).resolve().parents[2] / "GPTQModel"
-        if local.exists():
-            sys.path.insert(0, str(local))
-            from gptqmodel import GPTQModel
-            print("Imported GPTQModel from local GPTQModel clone.")
-        else:
-            raise
-
-    # NOTE: GPTQModel APIs differ between versions. The typical pattern:
-    # GPTQModel.from_pretrained(MODEL, device='cuda', quantize='8bit', ...)
-    # Some versions expect quantize_config/quantize param. We'll try the common signatures.
-    model = None
-    tried_signatures = []
-
-    # signature A (common)
-    try:
-        tried_signatures.append("from_pretrained(model_id, device='cuda', quantize='8bit')")
-        model = GPTQModel.from_pretrained(str(MODEL_LOCAL), device="cuda", quantize="8bit", use_triton=False)
-        print("GPTQModel: used signature A")
-    except Exception as e:
-        print("signature A failed:", e)
-
-    # signature B (alternate)
-    if model is None:
-        try:
-            tried_signatures.append("from_pretrained(model_id, quantize_config={'bits':8}, device='cuda')")
-            qc = {"bits": 8, "group_size": 128}
-            model = GPTQModel.from_pretrained(str(MODEL_LOCAL), quantize_config=qc, device="cuda")
-            print("GPTQModel: used signature B")
-        except Exception as e:
-            print("signature B failed:", e)
-
-    # signature C: direct quantize API after loading full model (if GPTQModel class has quantize())
-    if model is None:
-        try:
-            tried_signatures.append("load then model.quantize(bits=8, ...)")
-            # some GPTQModel packages provide a loader `from_pretrained` that returns raw model object
-            base = GPTQModel.load_from_pretrained(str(MODEL_LOCAL)) if hasattr(GPTQModel, "load_from_pretrained") else None
-            if base is None:
-                # attempt to instantiate and call quantize via module-level helper if available
-                raise RuntimeError("no load_from_pretrained available")
-            # call quantize
-            base.quantize(bits=8, group_size=128, desc_act=False)
-            model = base
-            print("GPTQModel: used signature C")
-        except Exception as e:
-            print("signature C failed:", e)
-
-    if model is None:
-        raise RuntimeError(f"GPTQModel 8-bit attempt failed (tried signatures: {tried_signatures}).")
-
-    # Save quantized model to OUTPUT_DIR (GPTQModel variants often provide save_quantized or save_pretrained)
-    try:
-        if hasattr(model, "save_quantized"):
-            model.save_quantized(str(OUTPUT_DIR))
-            print("Saved quantized model using model.save_quantized()")
-        else:
-            model.save_pretrained(str(OUTPUT_DIR))
-            print("Saved quantized model using save_pretrained()")
-        print("✅ GPTQModel 8-bit quantization finished and saved to:", OUTPUT_DIR)
-        raise SystemExit(0)  # success -> exit
-    except Exception as e:
-        print("Error while saving GPTQModel quantized model:", e)
-        # continue on to fallback
-
-except Exception as gptq_exc:
-    print("GPTQModel path failed. Error (traceback follows):")
-    traceback.print_exc()
-
-# Attempt 2: Fallback — bitsandbytes 8-bit (transformers + BitsAndBytesConfig)
-try:
-    print("\n>>> Falling back to bitsandbytes-style 8-bit (transformers + BitsAndBytesConfig).")
-    import torch
-    from transformers import AutoModelForCausalLM, AutoTokenizer
-    try:
-        from transformers import BitsAndBytesConfig
-    except Exception:
-        # fallback simple config if BitsAndBytesConfig not present in this transformers version
-        class BitsAndBytesConfig:
-            def __init__(self, **kwargs):
-                self.__dict__.update(kwargs)
-
-    bnb_cfg = BitsAndBytesConfig(load_in_8bit=True, llm_int8_threshold=6.0, llm_int8_enable_fp32_cpu_offload=True)
-    print("BitsAndBytesConfig:", bnb_cfg.__dict__ if hasattr(bnb_cfg, "__dict__") else str(bnb_cfg))
-
-    print("Loading tokenizer (no quant)...")
-    tokenizer = AutoTokenizer.from_pretrained(str(MODEL_LOCAL), trust_remote_code=True)
-
-    print("Loading model with 8-bit quantization...")
-    model = AutoModelForCausalLM.from_pretrained(
-        str(MODEL_LOCAL),
-        quantization_config=bnb_cfg,
-        device_map="auto",
-        trust_remote_code=True
-    )
-
-    print("Saving 8-bit model to disk...")
-    model.save_pretrained(str(OUTPUT_DIR))
-    tokenizer.save_pretrained(str(OUTPUT_DIR))
-    print("✅ bitsandbytes 8-bit model saved to:", OUTPUT_DIR)
-    raise SystemExit(0)
-
-except Exception as bnb_exc:
-    print("bitsandbytes fallback failed. Error (traceback follows):")
-    traceback.print_exc()
-
-# If we reach here, everything failed
-print("\n❌ All attempts failed. Summary:")
-print("- GPTQModel path error (see above).")
-print("- bitsandbytes fallback error (see above).")
-print("\nRecommendations:")
-print("1) Run this in WSL/Linux where building/using bitsandbytes & GPTQ CUDA extensions is more reliable.")
-print("2) Ensure CUDA and PyTorch versions match expected prebuilt bitsandbytes/GPTQ binaries.")
-print("3) If you want, paste the above tracebacks back here and I will parse the exact failure lines.")
+if __name__ == "__main__":
+    main()

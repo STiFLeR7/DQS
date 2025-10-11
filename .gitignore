@@ -1,6 +1,8 @@
 /models
 wandb_logs
-
+wandb
 .env
 wandb_autoinit
 __pycache__
+.env
+GPTQModel/

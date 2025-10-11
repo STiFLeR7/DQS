@@ -1,7 +1,7 @@
 /models
 wandb_logs
 wandb
-.env
+.venv
 wandb_autoinit
 __pycache__
 .env
